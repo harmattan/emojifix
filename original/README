@@ -1,0 +1,10 @@
+Place the file libsms-utils.so.0.0.0 from your device here,
+append .fremantle for the N900, and .harmattan for N9/N950:
+
+d90aa36887b557586fa27b4a4341b8b52b3bdb1c  libsms-utils.so.0.0.0.fremantle
+48bcd471a8f99b0bcb5502eb7d2af32b279778c0  libsms-utils.so.0.0.0.harmattan
+
+If you have developer mode enabled, and connected via USB:
+
+  scp user@192.168.2.15:/usr/lib/libsms-utils.so.0.0.0 \
+          libsms-utils.so.0.0.0.harmattan

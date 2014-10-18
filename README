@@ -1,0 +1,188 @@
+Emoji SMS Fix for the N9/N950 and N900
+--------------------------------------
+
+Web: http://thp.io/2014/emojifix/
+
+The Emoji SMS Fix consists of a patcher utility and a drop-in library that can
+be used to fix a bug in libsms-utils, causing incoming SMS containing Emoji
+characters to be silently dropped.
+
+Thanks to Jonni for the initial inspiration and some pointers.
+
+This fixes delivery of SMS to the SMS application. For actually displaying
+Emoji, you need to install Harmoji, which includes suitable fonts.
+
+
+THE BUG
+=======
+
+When an incoming SMS contains a Emoji outside of the Unicode range that is
+covered by UCS-2 is received, it's silently dropped by csd:
+
+    csd[...]: SMS-lib utils_tpdu_data_parse():
+        Error decoding TPDUs. Discarding message
+
+Digging deeper into the system libraries, utils_tpdu_data_parse() is found in
+libsms.so.0 and from there, we look for UCS-2 related functions:
+
+    $ objdump -T /usr/lib/libsms.so.0 | grep -i 'ucs.*2'
+    000168f8 g DF .text 00000054 Base isi_sms_conv_utf8_to_ucs2be
+    0001694c g DF .text 00000054 Base isi_sms_conv_ucs2be_to_utf8
+
+Given that the SMS encoding is UCS-2, and the middelware probably works with
+UTF-8, isi_sms_conv_ucs2be_to_utf8() seems to be the interesting function
+(ucs2be = UCS-2 Big Endian), but a quick search in /usr/lib/ doesn't turn up
+anything useful. Digging a little further gets us to libsms-utils.so.0, which
+has an interesting function sms_conv_ucs2_to_utf8(), and that one is actually
+called when the TPDU error happens.
+
+Breaking on this function in gdb and stepping through it reveals that iconv(3)
+is used to convert from UCS-2 to UTF-8, by using iconv_open(3) with "UTF-8" and
+"UCS-2" as parameters. This works great when the SMS is encoded in UTF-16, and
+all characters are in the unicode code point range 0x0000-0xFFFF. Some Emojis
+even are, but not all of them - those that are outside couldn't be encoded by
+UCS-2, but they can be encoded by UTF-16 (which is why iOS and Android use it).
+
+
+THE FIX
+=======
+
+The simple fix is to call iconv_open with "UTF-16" as the second argument
+instead of "UCS-2" in sms_conv_ucs2_to_utf8(). This could be done with
+LD_PRELOAD and wrapping iconv_open(3), but as we don't know all locations where
+the library libsms-utils.so.0 is used, we can't really do that reliably (I
+tried, and the SMS then failed in telepathy-ring instead, which apparently also
+does some parsing using libsms-utils).
+
+So the "easier" way is to modify libsms-utils.so.0 directly in such a way that
+when an application is linked against it, our custom iconv_open(3) function is
+used (but only for libsms-utils.so.0). Here's how it works normally:
+
+    <some application>  -> libsms-utils.so.0  ->  iconv_open() from glibc
+          |                                                ^
+          \------------------------------------------------/
+
+What we want to do is this (xconv_open is a wrapper we write for iconv_open):
+
+    <some application>  -> libsms-utils.so.0  ->  xconv_open()
+          |                                               |
+          \-----------> iconv_open() from glibc <---------/
+
+The way we achieve this is by actually creating a drop-in replacement for
+libsms-utils.so.0 that just defines our custom iconv_open(3) function, and
+then links against a modified version of the original libsms-utils.so.0
+(we call the modified version libemojitils.so.0):
+
+    <some application>  -> drop-in libsms-utils.so.0  ->  libemojitils.so.0
+                          (contains only xconv_open)           |
+                                               ^               |
+                                                \--------------/
+
+Our custom libsms-utils.so.0 is linked against libemojitils.so.0, so that all
+symbols exported by the original libsms-utils.so.0 will be available to the
+application at link time (otherwise the app would have unresolved symbols, and
+it would not load at all).
+
+Creating libemojitils.so.0 from the original libsms-utils.so.0 is relatively
+straightforward:
+
+  1. Change the SONAME from libsms-utils.so.0 to libemojitils.so.0
+     (this is needed, as we'll link against it later on)
+
+  2. Change the dynamic symbol name iconv_open() to xconv_open()
+     (so our wrapper is called every time iconv_open() is called)
+
+  3. Remove the symbol version information for iconv_open/xconv_open
+
+The reason for step (3) is that the symbol iconv_open is versioned to the
+symbol version GLIBC_2.4, and we have to remove that, otherwise loading it
+will fail, as it tries to look for xconv_open() in libc.so.6 instead of
+in the global symbols.
+
+The "patcher" utility takes care of those three steps.
+
+The remaining step is to create the drop-in replacement for libsms-utils.so.0
+with the following properties:
+
+  1. Contains a function xconv_open() with the same signature as iconv_open(3)
+
+  2. Links against libemojitils.so.0 (to pull in the real functions)
+
+The wrapper function is straightforward - just replace fromcode with "UTF-16"
+when when function is called with tocode="UTF-8" and fromcode="UCS-2":
+
+    iconv_t
+    xconv_open(const char *tocode, const char *fromcode)
+    {
+        if (strcmp(tocode, "UTF-8") == 0 && strcmp(fromcode, "UCS-2") == 0) {
+            fromcode = "UTF-16";
+        }
+
+        return iconv_open(tocode, fromcode);
+    }
+
+To link against libemojitils.so, we need to make sure the linker includes it
+even if it figures out that it's not really needed (our library doesn't use
+any of the functions in libemojitils.so.0 directly, so the linker does what
+would normally be the "right" thing and avoid the dependency, but we actually
+want to have the dependency here):
+
+    -Wl,--no-as-needed -L. -lemojitils
+
+After this, we are left with two files:
+
+  1. libemojitils.so.0: This is the original libsms-utils.so.0, but it calls
+                        xconv_open() instead of iconv_open(3)
+
+  2. libsms-utils.so.0: Contains xconv_open() and pulls in libemojitils.so.0
+
+Deploy those two files to /usr/lib/ on the device (make sure you are using an
+aegis-neutered kernel, or otherwise put those files into a libsms-utils0 .deb
+and install using any of the "com.nokia.maemo"-origin hacks to avoid MALF).
+
+Reboot the device, and from now on, Emoji SMS should be arriving. To also see
+the Emojis (and not just rectangular boxes), install Harmoji, which includes
+the right fonts.
+
+
+SHA1SUMS
+========
+
+Original and patched hashes for the N9 and N950 / MeeGo 1.2 "Harmattan":
+
+    48bcd471a8f99b0bcb5502eb7d2af32b279778c0  libsms-utils.so.0.0.0
+    1f6b0ae0af7cb4644da3092e2b7a85d874ed3979  libemojitils.so
+
+Original and patched hashes for the N900 / Maemo 5 "Fremantle":
+
+    48bcd471a8f99b0bcb5502eb7d2af32b279778c0  libsms-utils.so.0.0.0
+    300b7058aacbfa554bb43d3bb0c1bf9d63bf57e4  libemojitils.so
+
+
+LINKS
+=====
+
+Threads on TMO:
+http://talk.maemo.org/showthread.php?t=82210
+http://talk.maemo.org/showthread.php?t=85257
+http://talk.maemo.org/showthread.php?t=93427
+http://talk.maemo.org/showthread.php?t=93578
+
+Symbol Versioning:
+https://refspecs.linuxfoundation.org/LSB_3.1.0/LSB-Core-generic/LSB-Core-generic/symversion.html
+
+ELF file format header:
+http://linux.die.net/man/5/elf
+
+UTF-16, UCS-2 and the BMP:
+https://en.wikipedia.org/wiki/UTF-16
+https://en.wikipedia.org/wiki/Plane_%28Unicode%29#Basic_Multilingual_Plane
+
+SMS encoding:
+http://www.unicode.org/mail-arch/unicode-ml/y2011-m08/0429.html
+https://www.twilio.com/engineering/2012/11/08/adventures-in-unicode-sms
+http://android.stackexchange.com/questions/29962/what-encoding-is-text-messaging-in
+
+Harmoji:
+http://talk.maemo.org/showthread.php?t=86704
+https://code.google.com/p/harmoji/

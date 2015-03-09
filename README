@@ -29,7 +29,7 @@ libsms.so.0 and from there, we look for UCS-2 related functions:
     000168f8 g DF .text 00000054 Base isi_sms_conv_utf8_to_ucs2be
     0001694c g DF .text 00000054 Base isi_sms_conv_ucs2be_to_utf8
 
-Given that the SMS encoding is UCS-2, and the middelware probably works with
+Given that the SMS encoding is UCS-2, and the middleware probably works with
 UTF-8, isi_sms_conv_ucs2be_to_utf8() seems to be the interesting function
 (ucs2be = UCS-2 Big Endian), but a quick search in /usr/lib/ doesn't turn up
 anything useful. Digging a little further gets us to libsms-utils.so.0, which

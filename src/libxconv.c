@@ -12,6 +12,9 @@ xconv_open(const char *tocode, const char *fromcode)
         // the wrong encoding, so we use "UTF-16" instead and let iconv figure
         // out the byte order.
         fromcode = "UTF-16";
+    } else if (strcmp(tocode, "UCS-2") == 0 && strcmp(fromcode, "UTF-8") == 0) {
+        // Same as above, but for sending SMS (thanks hedayat and peterleinchen)
+        tocode = "UTF-16";
     }
 
     return iconv_open(tocode, fromcode);
